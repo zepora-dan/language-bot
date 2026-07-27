@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import logging
 from io import BytesIO
 
@@ -93,25 +94,45 @@ user_sessions: dict[int, dict] = {}
 
 MAX_HISTORY_MESSAGES = 10  # keep the last N turns to limit token usage
 
+# The model is asked to always separate its reply into two parts using this
+# marker: everything before it is pure target-language content (safe to read
+# aloud in the target language's voice), everything after is the
+# known-language explanation (never spoken aloud).
+REPLY_DELIMITER = "@@@"
+
 
 def build_system_prompt(known_language: str, target_language: str, level: str) -> str:
     return (
-        f"You are a friendly, patient conversation partner helping someone practice "
-        f"{target_language}. They already know {known_language}, and their self-rated "
-        f"level in {target_language} is {level}. "
-        f"Reply mainly in {target_language} to keep the conversation flowing. "
-        f"If they make a grammar or vocabulary mistake, gently point it out and give the "
-        f"corrected version -- explain the correction in {known_language} so it's clear, "
-        f"then continue the conversation in {target_language}. "
-        f"Keep replies conversational, short, and clear -- a sentence or two at most, "
-        f"since replies are also read aloud and long replies are harder to follow as speech. "
-        f"If their level is beginner, use simpler vocabulary and shorter sentences, and "
-        f"feel free to add a short {known_language} translation after new or difficult "
-        f"words or phrases. "
-        f"Special case: if their message is just a single word (in either language), do "
-        f"not reply conversationally -- reply with ONLY that word's translation between "
-        f"{known_language} and {target_language} (translate to whichever language it "
-        f"isn't already in), with nothing else added."
+        f"You are a translation and grammar-correction tool, NOT a conversation partner. "
+        f"The user already knows {known_language} and is learning {target_language} "
+        f"(self-rated level: {level}). You have exactly two jobs, and nothing else:\n\n"
+        f"1) If the user writes in {known_language} (or any other language): translate "
+        f"what they wrote into {target_language}.\n\n"
+        f"2) If the user writes in {target_language}: check it carefully for grammar "
+        f"mistakes (verb conjugation, word order, agreement, tense, articles, etc.) and "
+        f"vocabulary mistakes, and give the corrected version in {target_language}. If "
+        f"there is no mistake, just restate it correctly in {target_language}.\n\n"
+        f"STRICT OUTPUT FORMAT -- this is critical because the first part is converted "
+        f"to speech audio, so it must NEVER contain any {known_language} text:\n"
+        f"  <content entirely in {target_language} -- the translation or corrected/"
+        f"confirmed sentence, nothing else, no {known_language} words mixed in>\n"
+        f"  {REPLY_DELIMITER}\n"
+        f"  <short explanation entirely in {known_language} of any correction made, or "
+        f"leave this part empty if there was no mistake to explain>\n\n"
+        f"Always include the '{REPLY_DELIMITER}' marker on its own line exactly once, "
+        f"even if the explanation part is empty. Do NOT put any {known_language} before "
+        f"the marker, and do NOT put any {target_language} explanation after it beyond "
+        f"what's naturally part of the explanation.\n\n"
+        f"Do NOT hold a conversation. Do NOT answer questions, give opinions, share facts, "
+        f"or respond to the meaning/content of what the user writes -- treat every message "
+        f"purely as text to translate or correct, never as something to respond to "
+        f"conversationally. If the user writes a question (in either language), do not "
+        f"answer the question itself -- only translate it or correct its grammar. This "
+        f"applies no matter what the message is about, including anything unrelated to "
+        f"{target_language} -- you are not a general assistant, only a translation/"
+        f"correction tool for {target_language}. "
+        f"Keep the {target_language} part short and clear, since it is read aloud as "
+        f"audio. If the level is beginner, use simpler vocabulary where natural."
     )
 
 
@@ -151,8 +172,12 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def generate_reply(session: dict, user_text: str) -> str:
-    """Send the conversation so far to Gemini and return the reply text."""
+async def generate_reply(session: dict, user_text: str) -> tuple[str, str]:
+    """Send the conversation so far to Gemini and return (display_text, audio_text).
+    display_text is shown as the chat message (target-language content plus, if
+    present, the known-language explanation). audio_text is ONLY the
+    target-language portion -- this is what gets converted to speech, so the
+    user never hears known-language text read in the wrong voice."""
     history = session["history"]
     history.append({"role": "user", "parts": [user_text]})
     trimmed_history = history[-MAX_HISTORY_MESSAGES:]
@@ -164,22 +189,39 @@ async def generate_reply(session: dict, user_text: str) -> str:
         GEMINI_MODEL,
         system_instruction=system_prompt,
     )
-    response = model.generate_content(trimmed_history)
-    reply = response.text
+    # generate_content is a blocking network call -- run it off the event loop
+    # so one user's reply being generated doesn't freeze the bot for everyone else.
+    response = await asyncio.to_thread(model.generate_content, trimmed_history)
+    raw_reply = response.text
 
-    history.append({"role": "model", "parts": [reply]})
+    history.append({"role": "model", "parts": [raw_reply]})
     session["history"] = history
-    return reply
+
+    if REPLY_DELIMITER in raw_reply:
+        target_part, _, explanation_part = raw_reply.partition(REPLY_DELIMITER)
+    else:
+        # Model didn't follow the format -- treat the whole thing as target-language
+        # content so at least the audio still isn't mixed-language.
+        target_part, explanation_part = raw_reply, ""
+
+    audio_text = target_part.strip()
+    explanation_part = explanation_part.strip()
+    display_text = audio_text if not explanation_part else f"{audio_text}\n\n{explanation_part}"
+
+    return display_text, audio_text
 
 
 async def transcribe_audio(ogg_bytes: bytes) -> str:
     """Use Gemini's audio understanding to transcribe a voice message."""
     model = genai.GenerativeModel(GEMINI_MODEL)
-    response = model.generate_content([
-        {"mime_type": "audio/ogg", "data": ogg_bytes},
-        "Transcribe exactly what is said in this audio. "
-        "Output only the transcription, nothing else.",
-    ])
+    response = await asyncio.to_thread(
+        model.generate_content,
+        [
+            {"mime_type": "audio/ogg", "data": ogg_bytes},
+            "Transcribe exactly what is said in this audio. "
+            "Output only the transcription, nothing else.",
+        ],
+    )
     return response.text.strip()
 
 
@@ -251,12 +293,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         session["stage"] = "chatting"
         session["history"] = []
         await update.message.reply_text(
-            f"Perfect. Let's start chatting in {session['language']} "
-            f"({session['level']} level) -- I'll explain things in "
-            f"{session['known_language']} when helpful. You can type or send a "
-            f"voice message. I'll reply with text, and with audio too when "
-            f"available for this language. Send /reset any time to change "
-            f"language or level.",
+            f"Perfect. Send me anything -- a word, sentence, or paragraph -- and here's "
+            f"what I'll do:\n"
+            f"- If you write in {session['known_language']}, I'll translate it into "
+            f"{session['language']}.\n"
+            f"- If you write in {session['language']}, I'll check your grammar and "
+            f"correct any mistakes (explained in {session['known_language']}).\n"
+            f"I won't chat or answer questions -- just translate and correct. You can "
+            f"type or send a voice message. Send /reset any time to change language or "
+            f"level.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
@@ -264,7 +309,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Step 4: normal conversation practice (text)
     if session["stage"] == "chatting":
         try:
-            reply = await generate_reply(session, text)
+            display_text, audio_text = await generate_reply(session, text)
         except Exception as e:
             logger.error(f"Gemini chat error: {e}")
             await update.message.reply_text(
@@ -272,10 +317,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-        await update.message.reply_text(reply)
+        await update.message.reply_text(display_text)
 
         try:
-            audio = synthesize_speech(reply, session["language"])
+            audio = await asyncio.to_thread(synthesize_speech, audio_text, session["language"])
             if audio is not None:
                 await update.message.reply_audio(audio=audio)
         except Exception as e:
@@ -311,7 +356,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"I heard: \u201c{user_text}\u201d")
 
     try:
-        reply = await generate_reply(session, user_text)
+        display_text, audio_text = await generate_reply(session, user_text)
     except Exception as e:
         logger.error(f"Gemini chat error: {e}")
         await update.message.reply_text(
@@ -319,10 +364,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await update.message.reply_text(reply)
+    await update.message.reply_text(display_text)
 
     try:
-        audio = synthesize_speech(reply, session["language"])
+        audio = await asyncio.to_thread(synthesize_speech, audio_text, session["language"])
         if audio is not None:
             await update.message.reply_audio(audio=audio)
     except Exception as e:
